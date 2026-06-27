@@ -8,29 +8,31 @@ Each script handles the full deletion sequence for resources that require multip
 
 | Script | Description |
 |--------|-------------|
-| [`delete-waf-classic-acl.sh`](delete-waf-classic-acl.sh) | Safely delete a WAF Classic Web ACL and all its associated rules |
+| [`delete-waf-classic-acl.py`](delete-waf-classic-acl.py) | Safely delete a WAF Classic Web ACL and all its associated rules |
 
 ## Usage
 
-Each script supports `--dry-run` to preview the commands without executing them.
+Each script supports `--dry-run` to preview what it will do without making any changes.
 
 ```bash
 # Download a script
-curl -fsSL https://raw.githubusercontent.com/JungleCleaner/aws-cleanup-scripts/main/<script>.sh -o <script>.sh
+curl -fsSL https://raw.githubusercontent.com/JungleCleaner/aws-cleanup-scripts/main/<script>.py -o <script>.py
 
 # Inspect what it will do
-bash <script>.sh --help
-bash <script>.sh [options] --dry-run
+python3 <script>.py --help
+python3 <script>.py [options] --dry-run
 
 # Run for real
-bash <script>.sh [options]
+python3 <script>.py [options]
 ```
 
 ## Requirements
 
-- AWS CLI v2
-- `python3` (used for JSON parsing in some scripts)
+- Python 3.7+
+- [boto3](https://pypi.org/project/boto3/) — `pip install boto3`
 - Appropriate IAM permissions for the resources being deleted
+
+Works on macOS, Linux, and Windows.
 
 ## Contributing
 
@@ -38,4 +40,4 @@ PRs welcome. Each script should:
 - Support `--dry-run`
 - Print each step clearly before executing it
 - Be idempotent where possible
-- Include a `--help` flag
+- Include `--help`
