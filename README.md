@@ -8,7 +8,8 @@ Each script handles the full deletion sequence for resources that require multip
 
 | Script | Description |
 |--------|-------------|
-| [`delete-waf-classic-acl.py`](delete-waf-classic-acl.py) | Safely delete a WAF Classic Web ACL and all its associated rules |
+| [`delete-waf-classic-acl.py`](delete-waf-classic-acl.py) | Delete a WAF Classic Web ACL and all its associated rules in the correct order |
+| [`delete-route53-hosted-zone.py`](delete-route53-hosted-zone.py) | Delete a Route53 hosted zone and all its records |
 
 ## Usage
 
