@@ -10,6 +10,7 @@ Each script handles the full deletion sequence for resources that require multip
 |--------|-------------|
 | [`delete-waf-classic-acl.py`](delete-waf-classic-acl.py) | Delete a WAF Classic Web ACL and all its associated rules in the correct order |
 | [`delete-route53-hosted-zone.py`](delete-route53-hosted-zone.py) | Delete a Route53 hosted zone and all its records |
+| [`migrate-opensearch-classic-to-nextgen.py`](migrate-opensearch-classic-to-nextgen.py) | Migrate data from an OpenSearch Serverless Classic collection to an already-existing NextGen collection |
 
 ## Usage
 
