@@ -1,0 +1,404 @@
+# opensearch-nextgen.yaml
+#
+# Generic, self-contained reference template for an Amazon OpenSearch
+# Serverless NextGen collection + index. No VPC required - it also
+# includes a small test Lambda (with full aoss:* access) so you can deploy
+# this on its own and immediately confirm reads/writes work end to end,
+# with `aws lambda invoke`. Copy/adapt into your own stack for real use;
+# drop the test Lambda once you've wired up your actual application Lambda
+# the same way.
+#
+# WHY NEXTGEN: Classic OpenSearch Serverless collections carry a fixed
+# minimum floor charge (2 OCUs, always on, ~$700/month) even when
+# completely idle. NextGen collection groups can scale both indexing and
+# search capacity to zero, so a mostly-idle collection costs close to
+# nothing. Generation is immutable - you can't upgrade a Classic
+# collection in place, only create a NextGen one alongside it and migrate
+# data over (see ../migrate-opensearch-classic-to-nextgen.py in this repo).
+#
+# WHY NO VPC: Most Lambdas aren't in a VPC at all - that's really only
+# needed if a Lambda has to reach something only reachable from inside one
+# (RDS, ElastiCache, etc). Since this collection's network policy already
+# has to allow public access anyway (see the "CFN INDEX CAVEATS" comment
+# on OpenSearchIndex below), a non-VPC Lambda can just call the collection
+# endpoint directly, same as it would call any other AWS API - no NAT
+# gateway, VPC endpoint, or security group plumbing needed. If your Lambda
+# does run in a VPC, the only thing to add is a PrivateLink interface
+# endpoint (service `com.amazonaws.<region>.aoss-data`) in your VPC so its
+# traffic routes privately instead of over the public internet - the
+# policies/collection/index below don't need to change either way.
+#
+# SECURITY MODEL: network access (this template) and data access are
+# separate concerns. The network policy below controls which networks can
+# reach the endpoint at all (forced to public, per above); the data access
+# policy controls who can actually read/write once they get there - only
+# the test Lambda's role and the deploying principal are granted that.
+# OpenSearch Dashboards access is public the same way (toggle via
+# allowPublicDashboard), for humans logging in from wherever.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Generic, self-contained reference template for an Amazon OpenSearch
+  Serverless NextGen collection + index, with a test Lambda included so
+  you can confirm it works end to end. See the header comment above for
+  the full rationale.
+
+Parameters:
+  collectionName:
+    Type: String
+    Description: >
+      Name for the OpenSearch Serverless collection (and its group,
+      policies, etc - all derived from this by appending short suffixes
+      like "-data"). Capped at 27 chars, shorter than a collection name
+      normally needs to be (64 chars) - policy Name fields are capped at
+      32 chars by OpenSearch Serverless itself, and 27 leaves room for the
+      longest suffix used below.
+    AllowedPattern: ^[a-z][a-z0-9-]{2,26}$
+
+  indexName:
+    Type: String
+    Description: Name of the index to create inside the collection.
+
+  deployerPrincipalArn:
+    Type: String
+    Description: >
+      ARN of the IAM principal that will run `aws cloudformation deploy` (or
+      whatever assumes the stack's execution role). Required because
+      creating OpenSearchIndex below is a data-plane API call made by
+      CloudFormation itself at deploy time, using this principal - not the
+      test Lambda's role. See the CFN INDEX CAVEATS comment below. If you
+      deploy with a dedicated CloudFormation service role (--role-arn), use
+      that role's ARN here instead of your own. Being named here isn't
+      enough on its own - this principal also needs the identity-based IAM
+      permission aoss:APIAccessAll (e.g. via an existing admin policy), same
+      as testLambdaRole below has, or index creation still 403s.
+
+  allowPublicDashboard:
+    Type: String
+    Description: Whether OpenSearch Dashboards is reachable from the public internet (still gated by the data access policy, not just network location).
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  maxIndexingCapacityInOcu:
+    Type: Number
+    Default: 2
+  minIndexingCapacityInOcu:
+    Type: Number
+    Default: 0
+    Description: Almost always 0 - ingestion is typically a near-continuous stream, so indexing rarely goes idle long enough for scale-to-zero to matter.
+  maxSearchCapacityInOcu:
+    Type: Number
+    Default: 2
+  minSearchCapacityInOcu:
+    Type: Number
+    Default: 0
+    Description: >
+      Bump above 0 only if search traffic is sparse enough (>10min gaps) to
+      regularly hit NextGen's scale-to-zero and you care about avoiding the
+      resulting 10-30s cold start on the next query - e.g. a customer-facing
+      product with sporadic (not 24/7) usage.
+
+Conditions:
+  hasDashboardAccess: !Equals [!Ref allowPublicDashboard, "true"]
+
+Resources:
+  # ============================================================
+  # Policies
+  # ============================================================
+  openSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      # Policy Name is capped at 32 chars by OpenSearch Serverless itself -
+      # short suffixes throughout this template (rather than the more
+      # readable "-encryption-policy" etc) are to stay under that with
+      # collectionName still allowed up to 27 chars. See its Description.
+      Name: !Sub ${collectionName}-enc
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${collectionName}"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # Collection access is public - required so CloudFormation itself can
+  # create the index (see CFN INDEX CAVEATS below) and so the non-VPC test
+  # Lambda can reach it. This only controls *reachability*, not who can
+  # read/write, which is the data access policy's job below.
+  openSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub ${collectionName}-net
+      Type: network
+      Policy: !Sub |
+        [{
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${collectionName}"]
+            }
+          ],
+          "AllowFromPublic": true
+        }]
+
+  # Separate resource (rather than folding "dashboard" into the rule above)
+  # so it can be conditionally omitted - with no matching rule at all, the
+  # dashboard is simply unreachable from anywhere.
+  openSearchDashboardNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Condition: hasDashboardAccess
+    Properties:
+      Name: !Sub ${collectionName}-dash
+      Type: network
+      Policy: !Sub |
+        [{
+          "Rules": [
+            {
+              "ResourceType": "dashboard",
+              "Resource": ["collection/${collectionName}"]
+            }
+          ],
+          "AllowFromPublic": true
+        }]
+
+  # This is what actually gates reads/writes. `deployerPrincipalArn` is here
+  # because of the CFN INDEX CAVEATS below, not because it needs day-to-day
+  # access - feel free to remove it after the index exists and re-add it
+  # temporarily for future updates that touch the index definition.
+  openSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub ${collectionName}-data
+      Type: data
+      Policy: !Sub |
+        [{
+          "Description": "Access for the test Lambda and CloudFormation (index management)",
+          "Rules": [
+            {
+              "ResourceType": "index",
+              "Resource": ["index/${collectionName}/*"],
+              "Permission": ["aoss:*"]
+            },
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${collectionName}"],
+              "Permission": ["aoss:*"]
+            }
+          ],
+          "Principal": [
+            "${testLambdaRole.Arn}",
+            "${deployerPrincipalArn}"
+          ]
+        }]
+
+  # ============================================================
+  # Collection group + collection
+  # ============================================================
+  openSearchCollectionGroup:
+    Type: AWS::OpenSearchServerless::CollectionGroup
+    Properties:
+      # CollectionGroup Name is also capped at 32 chars, same as the
+      # policies above - hence "-grp" rather than "-group".
+      Name: !Sub ${collectionName}-grp
+      Generation: NEXTGEN
+      # NextGen collection groups don't support disabling standby replicas
+      # (unlike Classic) - ENABLED is the only valid value.
+      StandbyReplicas: ENABLED
+      CapacityLimits:
+        MinIndexingCapacityInOcu: !Ref minIndexingCapacityInOcu
+        MaxIndexingCapacityInOcu: !Ref maxIndexingCapacityInOcu
+        MinSearchCapacityInOcu: !Ref minSearchCapacityInOcu
+        MaxSearchCapacityInOcu: !Ref maxSearchCapacityInOcu
+
+  openSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Ref collectionName
+      Type: SEARCH
+      # Must be the literal group name - can't use !Ref (resolves to the
+      # group's generated Id) or !GetAtt (Name isn't a readOnly attribute)
+      # here, and it must match openSearchCollectionGroup's Name above.
+      CollectionGroupName: !Sub ${collectionName}-grp
+    DependsOn:
+      - openSearchEncryptionPolicy
+      - openSearchCollectionGroup
+
+  # ============================================================
+  # Index
+  #
+  # CFN INDEX CAVEATS (read this before you fight a 403 for an hour):
+  #   1. CloudFormation itself makes this "create index" API call, from
+  #      AWS-managed infrastructure - not from any Lambda or VPC you
+  #      control. That's why openSearchNetworkPolicy above must allow
+  #      public access to the collection, regardless of how locked-down
+  #      you'd otherwise like it.
+  #   2. The identity making that call is whichever principal is deploying
+  #      this stack (or the CloudFormation service role, if you deploy with
+  #      one via --role-arn) - NOT the test Lambda's role. That's
+  #      `deployerPrincipalArn` above; without it in the data access
+  #      policy, index creation fails with a 403.
+  #   Also: index creation is asynchronous on the OpenSearch Serverless
+  #   side - CloudFormation can report CREATE_COMPLETE a few seconds before
+  #   the index actually accepts reads/writes. Don't be surprised by
+  #   transient errors immediately after a fresh deploy; the test Lambda
+  #   below doesn't retry, so if you invoke it too soon you may see one.
+  # ============================================================
+  openSearchIndex:
+    Type: AWS::OpenSearchServerless::Index
+    Properties:
+      CollectionEndpoint: !GetAtt openSearchCollection.CollectionEndpoint
+      IndexName: !Ref indexName
+      # Example mapping - replace with your own fields. Omit Mappings
+      # entirely for a fully dynamic-mapped index (fine for prototyping;
+      # define explicit mappings for anything you actually care about).
+      # PropertyMapping.Type only supports a small, fixed enum here - text,
+      # keyword, integer, knn_vector - a real restriction of this CFN
+      # resource type, not of OpenSearch Serverless itself (its document
+      # API supports the usual full range, e.g. date). That's why
+      # createdAt is mapped as keyword (exact-match string) rather than a
+      # proper date type.
+      Mappings:
+        Properties:
+          title:
+            Type: text
+          createdAt:
+            Type: keyword
+    DependsOn:
+      - openSearchCollection
+      - openSearchDataAccessPolicy
+      - openSearchNetworkPolicy
+
+  # ============================================================
+  # Test Lambda - proves the whole setup works end to end. Writes one
+  # document to the index and reads it straight back by _id (rather than
+  # _search, which would need to wait for the index to refresh). Not
+  # wired into anything - invoke it manually:
+  #   aws lambda invoke --function-name <TestLambdaFunctionName output> \
+  #     --cli-binary-format raw-in-base64-out /dev/stdout
+  # ============================================================
+  testLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${collectionName}-test-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        # Being named in openSearchDataAccessPolicy is necessary but not
+        # sufficient - OpenSearch Serverless data access has two separate
+        # layers, and this identity-based IAM permission is the other one.
+        # Without it, requests still 403 even with a correct data access
+        # policy entry. (aoss:DashboardsAccessAll isn't needed here since
+        # this role never accesses Dashboards - only the human principals
+        # you log into Dashboards with need that one.)
+        - PolicyName: opensearch-data-plane-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                # Ref on a Collection resource returns its generated ID, not
+                # its Name - that's what this ARN format requires too.
+                Resource: !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${openSearchCollection}
+
+  testLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${collectionName}-test-lambda
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt testLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          COLLECTION_ENDPOINT: !GetAtt openSearchCollection.CollectionEndpoint
+          INDEX_NAME: !Ref indexName
+      # Inline code only (no S3/asset upload) to keep this template fully
+      # self-contained - uses just boto3/botocore for SigV4 signing, both
+      # bundled in the Lambda Python runtime by default, no layers needed.
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          ENDPOINT = os.environ["COLLECTION_ENDPOINT"]
+          INDEX_NAME = os.environ["INDEX_NAME"]
+          REGION = os.environ["AWS_REGION"]
+
+
+          def _signed_request(method, path, body=None):
+              url = f"{ENDPOINT}{path}"
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              # Unlike most services, AOSS requires x-amz-content-sha256 on every
+              # signed request (even bodyless ones, via the empty-string hash) -
+              # botocore's generic SigV4Auth only adds this automatically for S3,
+              # so it must be set explicitly here or every request gets a bare
+              # "403 Forbidden" with no detail (look for response header
+              # x-aoss-response-hint: X01:gw-helper-deny if you see this again).
+              content_sha256 = hashlib.sha256(data or b"").hexdigest()
+              request = AWSRequest(
+                  method=method, url=url, data=data,
+                  headers={
+                      "Content-Type": "application/json",
+                      "X-Amz-Content-SHA256": content_sha256,
+                  },
+              )
+              SigV4Auth(boto3.Session().get_credentials(), "aoss", REGION).add_auth(request)
+              req = urllib.request.Request(
+                  url, data=data, method=method, headers=dict(request.headers)
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.status, json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read().decode("utf-8"))
+
+
+          def handler(event, context):
+              doc_id = "test-doc-1"
+              doc = {"title": "Hello from the test Lambda", "createdAt": "2026-01-01T00:00:00Z"}
+
+              write_status, write_body = _signed_request(
+                  "PUT", f"/{INDEX_NAME}/_doc/{doc_id}", doc
+              )
+              # GET by _id (not _search) sidesteps index refresh latency -
+              # it always reflects the latest write, unlike search, which
+              # can take ~1s to pick up a just-written document.
+              read_status, read_body = _signed_request("GET", f"/{INDEX_NAME}/_doc/{doc_id}")
+
+              result = {
+                  "write": {"status": write_status, "body": write_body},
+                  "read": {"status": read_status, "body": read_body},
+              }
+              print(json.dumps(result))
+              return result
+
+Outputs:
+  CollectionEndpoint:
+    Description: The OpenSearch NextGen collection endpoint
+    Value: !GetAtt openSearchCollection.CollectionEndpoint
+
+  CollectionArn:
+    Description: ARN of the OpenSearch NextGen collection
+    Value: !GetAtt openSearchCollection.Arn
+
+  TestLambdaFunctionName:
+    Description: Invoke this to confirm the collection/index accepts reads and writes
+    Value: !Ref testLambdaFunction
